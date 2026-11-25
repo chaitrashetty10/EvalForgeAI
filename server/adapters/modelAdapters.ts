@@ -48,16 +48,20 @@ function getGeminiClient(): GoogleGenAI {
 }
 
 export function getProviderAvailability() {
-  const geminiConfigured = Boolean(
-    process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
+  const geminiKey = process.env.GEMINI_API_KEY?.trim();
+  const geminiConfigured = Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY');
+  const groqKey = process.env.GROQ_API_KEY?.trim();
+  const groqConfigured = Boolean(groqKey && groqKey !== 'MY_GROQ_API_KEY');
+  const ollamaEndpoint = process.env.OLLAMA_BASE_URL?.trim() || null;
+  const ollamaConfigured = Boolean(
+    ollamaEndpoint &&
+      (ollamaEndpoint.startsWith('http://') || ollamaEndpoint.startsWith('https://'))
   );
-  const groqConfigured = Boolean(process.env.GROQ_API_KEY);
-  const ollamaEndpoint = process.env.OLLAMA_BASE_URL || null;
   return {
     geminiConfigured,
     groqConfigured,
-    ollamaConfigured: Boolean(ollamaEndpoint),
-    ollamaEndpoint: ollamaEndpoint ? 'Configured (server env)' : null,
+    ollamaConfigured,
+    ollamaEndpoint: ollamaConfigured ? 'Configured (server env)' : null,
     rateLimiter: globalRateLimiter.getStatus(),
   };
 }

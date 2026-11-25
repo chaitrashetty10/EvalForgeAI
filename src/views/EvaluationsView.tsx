@@ -46,8 +46,9 @@ export function EvaluationsView({
     preselect?.datasetId ?? datasets[0]?.id ?? ''
   );
   const [execMode, setExecMode] = useState<'auto' | 'live' | 'local' | 'simulated'>(
-    providerStatus?.geminiConfigured ? 'live' : 'simulated'
+    providerStatus?.geminiConfigured || providerStatus?.groqConfigured ? 'live' : 'simulated'
   );
+  const modeTouchedRef = useRef(false);
   const [useLlmJudge, setUseLlmJudge] = useState<boolean>(false);
   const [repeatCount, setRepeatCount] = useState<number>(1);
   const [runName, setRunName] = useState<string>('');
@@ -57,6 +58,14 @@ export function EvaluationsView({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string>(runs[0]?.id ?? '');
   const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    if (!modeTouchedRef.current && providerStatus) {
+      setExecMode(
+        providerStatus.geminiConfigured || providerStatus.groqConfigured ? 'live' : 'simulated'
+      );
+    }
+  }, [providerStatus]);
 
   useEffect(() => {
     if (preselect?.track) {
@@ -104,6 +113,18 @@ export function EvaluationsView({
     );
   };
 
+  const extractResponseError = async (resp: Response, fallbackLabel: string) => {
+    const raw = await resp.text().catch(() => '');
+    try {
+      const parsed = JSON.parse(raw) as { error?: string };
+      if (parsed.error) return parsed.error;
+    } catch {
+      // Non-JSON response (e.g. HTML error page from edge/proxy)
+    }
+    const statusInfo = resp.status ? ` (HTTP ${resp.status})` : '';
+    return `${fallbackLabel}${statusInfo}`;
+  };
+
   const executeStreamRun = async (overrideMode?: 'simulated') => {
     setErrorMsg(null);
     const dataset = datasets.find((d) => d.id === datasetId);
@@ -117,7 +138,29 @@ export function EvaluationsView({
     }
 
     const modeToUse = overrideMode ?? execMode;
-    if (overrideMode) setExecMode(overrideMode);
+    if (overrideMode) {
+      modeTouchedRef.current = true;
+      setExecMode(overrideMode);
+    }
+
+    const requestBody = JSON.stringify({
+      runName:
+        runName.trim() ||
+        `${track === 'llm' ? 'LLM' : 'Agent'} Eval — ${dataset.name}`,
+      track,
+      mode: modeToUse,
+      environment: settings.environment,
+      dataset,
+      models,
+      agents,
+      targetIds: selectedTargets,
+      repeatCount,
+      weights: track === 'llm' ? settings.llmWeights : settings.agentWeights,
+      safetyGates: settings.safetyGates,
+      enableLlmJudge: modeToUse === 'simulated' ? settings.enableLlmJudge : useLlmJudge,
+      judgeModelId: settings.judgeModelId,
+      baselineRunId: baselineRunId || null,
+    });
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -133,71 +176,81 @@ export function EvaluationsView({
     });
 
     try {
+      let completedRun: EvaluationRun | null = null;
+      let shouldFallbackSync = false;
+
       const response = await fetch('/api/evaluations/run-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
-        body: JSON.stringify({
-          runName:
-            runName.trim() ||
-            `${track === 'llm' ? 'LLM' : 'Agent'} Eval — ${dataset.name}`,
-          track,
-          mode: modeToUse,
-          environment: settings.environment,
-          dataset,
-          models,
-          agents,
-          targetIds: selectedTargets,
-          repeatCount,
-          weights: track === 'llm' ? settings.llmWeights : settings.agentWeights,
-          safetyGates: settings.safetyGates,
-          enableLlmJudge: modeToUse === 'simulated' ? settings.enableLlmJudge : useLlmJudge,
-          judgeModelId: settings.judgeModelId,
-          baselineRunId: baselineRunId || null,
-        }),
+        body: requestBody,
       });
 
       if (!response.ok || !response.body) {
-        const errBody = await response.json().catch(() => ({}));
-        throw new Error((errBody as { error?: string }).error || 'Evaluation request failed.');
-      }
+        if (response.status === 404 || response.status === 405) {
+          shouldFallbackSync = true;
+        } else {
+          throw new Error(await extractResponseError(response, 'Evaluation request failed'));
+        }
+      } else {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let completedRun: EvaluationRun | null = null;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split('\n\n');
+          buffer = frames.pop() ?? '';
 
-        const frames = buffer.split('\n\n');
-        buffer = frames.pop() ?? '';
+          for (const frame of frames) {
+            const eventMatch = frame.match(/^event:\s*(.+)$/m);
+            const dataMatch = frame.match(/^data:\s*(.+)$/m);
+            if (!eventMatch || !dataMatch) continue;
 
-        for (const frame of frames) {
-          const eventMatch = frame.match(/^event:\s*(.+)$/m);
-          const dataMatch = frame.match(/^data:\s*(.+)$/m);
-          if (!eventMatch || !dataMatch) continue;
+            const eventName = eventMatch[1].trim();
+            const payload = JSON.parse(dataMatch[1]) as Record<string, unknown>;
 
-          const eventName = eventMatch[1].trim();
-          const payload = JSON.parse(dataMatch[1]) as Record<string, unknown>;
-
-          if (eventName === 'progress') {
-            setProgress(payload as unknown as StreamProgress);
-          } else if (eventName === 'complete') {
-            completedRun = (payload as { run: EvaluationRun }).run;
-          } else if (eventName === 'error') {
-            throw new Error(String(payload.error || 'Evaluation stream error'));
+            if (eventName === 'progress') {
+              setProgress(payload as unknown as StreamProgress);
+            } else if (eventName === 'complete') {
+              completedRun = (payload as { run: EvaluationRun }).run;
+            } else if (eventName === 'error') {
+              throw new Error(String(payload.error || 'Evaluation stream error'));
+            }
           }
+        }
+
+        if (!completedRun) {
+          shouldFallbackSync = true;
         }
       }
 
-      if (completedRun) {
-        addRun(completedRun);
-        setSelectedRunId(completedRun.id);
-        setRunName('');
+      if (shouldFallbackSync) {
+        const syncResp = await fetch('/api/evaluations/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: requestBody,
+        });
+        if (!syncResp.ok) {
+          throw new Error(await extractResponseError(syncResp, 'Evaluation request failed'));
+        }
+        const syncData = (await syncResp.json()) as { run?: EvaluationRun };
+        if (syncData.run) {
+          completedRun = syncData.run;
+        }
       }
+
+      if (!completedRun) {
+        throw new Error('Evaluation did not return any run results.');
+      }
+
+      addRun(completedRun);
+      setSelectedRunId(completedRun.id);
+      setRunName('');
       await refreshProviderStatus();
     } catch (err) {
       if ((err as Error).name === 'AbortError') {
@@ -272,9 +325,10 @@ export function EvaluationsView({
               <span className="text-slate-400">Mode:</span>
               <select
                 value={execMode}
-                onChange={(e) =>
-                  setExecMode(e.target.value as 'auto' | 'live' | 'local' | 'simulated')
-                }
+                onChange={(e) => {
+                  modeTouchedRef.current = true;
+                  setExecMode(e.target.value as 'auto' | 'live' | 'local' | 'simulated');
+                }}
                 className="bg-slate-950 border border-slate-800 rounded-md px-3 py-1.5 text-xs text-slate-100 focus:outline-none focus:border-sky-500"
               >
                 <option value="live">
