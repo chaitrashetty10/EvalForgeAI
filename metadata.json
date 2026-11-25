@@ -1,0 +1,6 @@
+{
+  "name": "EvalForge AI",
+  "description": "Unified enterprise AI model and autonomous agent evaluation harness with deterministic checks, LLM-as-a-Judge rubrics, execution trace observability, and statistical benchmarking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
