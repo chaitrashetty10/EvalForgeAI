@@ -77,7 +77,18 @@ export function EvaluationsView({
   const handleTrackSwitch = (nextTrack: 'llm' | 'agent') => {
     setTrack(nextTrack);
     if (nextTrack === 'llm') {
-      setSelectedTargets(models.slice(0, 2).map((m) => m.id));
+      const cloudReadyModels = models.filter(
+        (m) =>
+          m.provider === 'google-gemini' ||
+          (m.provider === 'ollama' &&
+            (providerStatus?.ollamaConfigured || providerStatus?.groqConfigured)) ||
+          (m.provider === 'groq' && providerStatus?.groqConfigured)
+      );
+      setSelectedTargets(
+        (cloudReadyModels.length > 0 ? cloudReadyModels : models)
+          .slice(0, 2)
+          .map((m) => m.id)
+      );
       const llmDs = datasets.find((d) => d.targetTrack !== 'agent');
       if (llmDs) setDatasetId(llmDs.id);
     } else {
@@ -354,10 +365,15 @@ export function EvaluationsView({
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
             {(track === 'llm' ? models : agents).map((item) => {
               const checked = selectedTargets.includes(item.id);
-              const sub =
+              let sub =
                 'provider' in item
                   ? `${item.provider} · ${item.modelId}`
                   : `${item.framework} · ${item.planningStrategy}`;
+              if ('provider' in item && item.provider === 'ollama' && !providerStatus?.ollamaConfigured) {
+                sub = providerStatus?.groqConfigured
+                  ? `${item.modelId} · Groq cloud fallback`
+                  : `${item.modelId} · Local/Groq unset`;
+              }
               return (
                 <label
                   key={item.id}

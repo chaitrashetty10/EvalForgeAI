@@ -93,9 +93,13 @@ export function ModelsView({
         : { label: 'Simulation Ready (Key Unset)', color: 'text-amber-400' };
     }
     if (m.provider === 'ollama') {
-      return providerStatus?.ollamaConfigured
-        ? { label: 'Local Ollama Ready', color: 'text-sky-400' }
-        : { label: 'Simulation Ready (Local Unset)', color: 'text-amber-400' };
+      if (providerStatus?.ollamaConfigured) {
+        return { label: 'Local Ollama Ready', color: 'text-sky-400' };
+      }
+      if (providerStatus?.groqConfigured) {
+        return { label: 'Groq Cloud Fallback Ready', color: 'text-emerald-400' };
+      }
+      return { label: 'Simulation Ready (Local/Groq Unset)', color: 'text-amber-400' };
     }
     if (m.provider === 'groq') {
       return providerStatus?.groqConfigured

@@ -166,6 +166,91 @@ function runSimulatedModel(req: ModelInvocationRequest): ModelInvocationResponse
   };
 }
 
+function resolveGroqFallbackModel(localModelId: string): string {
+  const id = localModelId.toLowerCase();
+  if (id.includes('deepseek')) return 'deepseek-r1-distill-llama-70b';
+  if (id.includes('llama3.2') || id.includes('3b') || id.includes('8b')) {
+    return 'llama-3.1-8b-instant';
+  }
+  return 'llama-3.3-70b-versatile';
+}
+
+async function invokeGroqApi(params: {
+  groqKey: string;
+  groqModelId: string;
+  prompt: string;
+  systemInstruction?: string;
+  timeoutMs: number;
+  versionLabel: string;
+}): Promise<ModelInvocationResponse> {
+  const { groqKey, groqModelId, prompt, systemInstruction, timeoutMs, versionLabel } = params;
+
+  await globalRateLimiter.acquire();
+  try {
+    const start = Date.now();
+    const { result, retries } = await withExponentialBackoff(
+      () =>
+        withTimeout(
+          fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${groqKey}`,
+            },
+            body: JSON.stringify({
+              model: groqModelId,
+              messages: [
+                ...(systemInstruction
+                  ? [{ role: 'system', content: systemInstruction }]
+                  : []),
+                { role: 'user', content: prompt },
+              ],
+              temperature: 0.2,
+            }),
+          }).then(async (r) => {
+            if (!r.ok) {
+              const body = await r.text();
+              throw new Error(`Groq HTTP ${r.status}: ${body.slice(0, 200)}`);
+            }
+            return r.json() as Promise<{
+              choices?: Array<{ message?: { content?: string } }>;
+              usage?: {
+                prompt_tokens?: number;
+                completion_tokens?: number;
+                total_tokens?: number;
+              };
+            }>;
+          }),
+          timeoutMs,
+          `Groq (${groqModelId})`
+        ),
+      1
+    );
+    const totalLatencyMs = Math.max(50, Date.now() - start);
+    const text = result.choices?.[0]?.message?.content ?? '';
+    const inputTokens = result.usage?.prompt_tokens ?? estimateTokens(prompt);
+    const outputTokens = result.usage?.completion_tokens ?? estimateTokens(text);
+    const totalTokens = result.usage?.total_tokens ?? inputTokens + outputTokens;
+
+    return {
+      text,
+      executionOrigin: 'live',
+      inputTokens,
+      outputTokens,
+      totalTokens,
+      ttftMs: Math.round(totalLatencyMs * 0.25),
+      totalLatencyMs,
+      tokensPerSec:
+        Math.round((outputTokens / Math.max(0.05, totalLatencyMs / 1000)) * 10) / 10,
+      estimatedCostUsd: 0,
+      retries,
+      modelVersion: versionLabel,
+    };
+  } finally {
+    globalRateLimiter.release();
+  }
+}
+
 export async function invokeModelAdapter(
   req: ModelInvocationRequest
 ): Promise<ModelInvocationResponse> {
@@ -244,80 +329,42 @@ export async function invokeModelAdapter(
   }
 
   if (provider === 'groq') {
-    const groqKey = process.env.GROQ_API_KEY;
+    const groqKey = process.env.GROQ_API_KEY?.trim();
     if (!groqKey) {
       throw new Error(
         'GROQ_API_KEY is not configured on the server. Add GROQ_API_KEY or switch execution mode to Simulation.'
       );
     }
-    await globalRateLimiter.acquire();
-    try {
-      const start = Date.now();
-      const { result, retries } = await withExponentialBackoff(
-        () =>
-          withTimeout(
-            fetch('https://api.groq.com/openai/v1/chat/completions', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${groqKey}`,
-              },
-              body: JSON.stringify({
-                model: req.model.modelId,
-                messages: [
-                  ...(req.systemInstruction
-                    ? [{ role: 'system', content: req.systemInstruction }]
-                    : []),
-                  { role: 'user', content: req.prompt },
-                ],
-                temperature: 0.2,
-              }),
-            }).then(async (r) => {
-              if (!r.ok) {
-                const body = await r.text();
-                throw new Error(`Groq HTTP ${r.status}: ${body.slice(0, 200)}`);
-              }
-              return r.json() as Promise<{
-                choices?: Array<{ message?: { content?: string } }>;
-                usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
-              }>;
-            }),
-            timeoutMs,
-            `Groq (${req.model.modelId})`
-          ),
-        1
-      );
-      const totalLatencyMs = Math.max(50, Date.now() - start);
-      const text = result.choices?.[0]?.message?.content ?? '';
-      const inputTokens = result.usage?.prompt_tokens ?? estimateTokens(req.prompt);
-      const outputTokens = result.usage?.completion_tokens ?? estimateTokens(text);
-      const totalTokens = result.usage?.total_tokens ?? inputTokens + outputTokens;
-
-      return {
-        text,
-        executionOrigin: 'live',
-        inputTokens,
-        outputTokens,
-        totalTokens,
-        ttftMs: Math.round(totalLatencyMs * 0.25),
-        totalLatencyMs,
-        tokensPerSec: Math.round((outputTokens / Math.max(0.05, totalLatencyMs / 1000)) * 10) / 10,
-        estimatedCostUsd: 0,
-        retries,
-        modelVersion: req.model.modelId,
-      };
-    } finally {
-      globalRateLimiter.release();
-    }
+    return invokeGroqApi({
+      groqKey,
+      groqModelId: req.model.modelId,
+      prompt: req.prompt,
+      systemInstruction: req.systemInstruction,
+      timeoutMs,
+      versionLabel: req.model.modelId,
+    });
   }
 
   if (provider === 'ollama') {
-    const baseUrl = process.env.OLLAMA_BASE_URL;
+    const baseUrl = process.env.OLLAMA_BASE_URL?.trim();
     if (!baseUrl) {
+      const groqKey = process.env.GROQ_API_KEY?.trim();
+      if (groqKey) {
+        const fallbackModel = resolveGroqFallbackModel(req.model.modelId);
+        return invokeGroqApi({
+          groqKey,
+          groqModelId: fallbackModel,
+          prompt: req.prompt,
+          systemInstruction: req.systemInstruction,
+          timeoutMs,
+          versionLabel: `${fallbackModel} (Groq fallback for ${req.model.modelId})`,
+        });
+      }
       throw new Error(
-        'OLLAMA_BASE_URL is not configured in server environment. Set OLLAMA_BASE_URL (e.g. http://127.0.0.1:11434) for local models or select Simulation Mode.'
+        'OLLAMA_BASE_URL is empty and GROQ_API_KEY is unset. Configure OLLAMA_BASE_URL for local inference, set GROQ_API_KEY for cloud fallback, or run in Simulation Mode.'
       );
     }
+
     const parsed = new URL('/api/chat', baseUrl);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       throw new Error('Invalid OLLAMA_BASE_URL protocol.');
@@ -364,7 +411,8 @@ export async function invokeModelAdapter(
         totalTokens: inputTokens + outputTokens,
         ttftMs: Math.round(totalLatencyMs * 0.25),
         totalLatencyMs,
-        tokensPerSec: Math.round((outputTokens / Math.max(0.05, totalLatencyMs / 1000)) * 10) / 10,
+        tokensPerSec:
+          Math.round((outputTokens / Math.max(0.05, totalLatencyMs / 1000)) * 10) / 10,
         estimatedCostUsd: 0,
         retries: 0,
         modelVersion: `${req.model.modelId} (Local Ollama)`,
